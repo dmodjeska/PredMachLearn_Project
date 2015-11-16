@@ -1,0 +1,274 @@
+---
+title: "Practical Machine Learning - Course Project"
+author: "David Modjeska"
+date: "November 12, 2015"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache = TRUE, warning = FALSE, message = FALSE)
+```
+
+### Human Activity Recognition - Weightlifting Quality
+
+### Summary
+
+The "quantified self" movement, and research in human activity recognition (HAR), have generated a significant amount of data on personal behaviors. One HAR study monitored a group of 6 people exercising with weights, in order to determine the quality of their execution. In this report, machine learning methods are used on study data to predict exercise quality. Eight algorithms were evaluated. In cross-validation, the final random-forest model gave the best predictions, with resampling accuracy of approximately 99.7% and kappa of approximately 99.6%. The out-of-sample error rate is estimated at approximately 0.3%.
+
+### Introduction
+
+As part of the "quantified self" movement, many people use wearable digital monitors to collect data about personal activities. The goal is to improve health or gain insight into behaviors. People traditionally monitor quantity of activity, but less often quality. [A study in the area of human activity recognition](http://groupware.les.inf.puc-rio.br/har) investigated exercise quality with six participants doing weight lifting. Participants performed an exercise set according to instruction, either correctly (in one way) or incorrectly (in four ways). On-body sensors were used to collect data about execution. Instrumentation was on arms, forearms, belt, and dumbell. This report replicates the use of machine learning to predict exercise outcomes from the sensor data. Research results of this type are potentially useful for fields such as sports training. 
+
+### Getting, Cleaning, and Exploring Data
+
+Data were first downloaded from the above source in CSV format. A number of derived columns included significant numbers of NA values, so these columns were selected out of the data set for training models Also, relatively more administrative columns such as timestamp and username were removed for the same reason.  
+
+```{r, echo = FALSE, cache = TRUE}
+
+library(dplyr)
+library(readr)
+library(tidyr)
+library(ggplot2)
+
+library(caret)
+library(AppliedPredictiveModeling)
+
+# GET DATA ------------------
+
+train_data_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+train_data_file <- "pml-training.csv"
+if (!file.exists(train_data_file))
+    download.file(train_data_url, train_data_file, method = "curl")
+train_data <- read.csv(train_data_file)
+train_data_clean <- train_data %>%
+    dplyr::select(-user_name,
+           -X,
+           -contains("timestamp"),
+           -contains("window"),
+           -starts_with("total"),
+           -starts_with("kurtosis"),
+           -starts_with("skewness"),
+           -starts_with("max"),
+           -starts_with("min"),
+           -starts_with("amplitude"),
+           -starts_with("var"),
+           -starts_with("avg"),
+           -starts_with("stddev"))
+
+test_data_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+test_data_file <- "pml-testing.csv"
+if (!file.exists(test_data_file))
+    download.file(test_data_url, test_data_file, method = "curl")
+test_data <- read.csv(test_data_file)
+
+```
+
+In considering the question of whether all remaining variables are necessary for training, a call to nearZeroVar() shows that they are. Also, a histogram shows that the 5 outcome classes are approximately balanced.
+
+```{r, echo = FALSE, eval = FALSE, cache = TRUE}
+
+# CLEAN AND EXPLORE DATA -----------------------------------
+
+str(train_data_clean)
+summary(train_data_clean)
+
+# all vars are necessary
+nsv <- nearZeroVar(train_data_clean, saveMetrics = TRUE)
+
+# the outcome classes are approximately balanced
+ggplot(data = train_data_clean, aes(x = classe)) + geom_histogram()
+
+```
+
+Let's look at the remaining training measures in boxplot form. The number of measures is 48, which is large but manageable. Of obvious concern is the large number of outliers. So let's remove the most extreme outliers (approximately 5% of the data set), using criteria of less/more than 5 times the inter-quartile distance less than the first/third quartile, respectively. The number of rows remaining in the dataset is 19622.
+
+```{r, echo = FALSE, cache = TRUE}
+
+# exploratory plotting - all
+train_measures <- train_data_clean %>%
+    dplyr::select(-classe)
+train_gather <- train_measures %>%
+    gather()
+ggplot(data = train_gather, aes(x = key, y = value)) +
+    geom_boxplot() +
+    ggtitle("Box Plot of Training Variables") +
+    theme(axis.text.x=element_text(angle = 90, size = 7.5))
+
+# remove extreme outliers, approximately 5% of dataset
+train_data_clean2 <- train_data_clean
+num_cols <- ncol(train_data_clean)
+for (i in 1:(num_cols - 1)) {
+    offset <- 5.25 * IQR(train_data_clean2[ , i])
+    quant <- quantile(train_data_clean2[ , i], probs=c(.25, .75))
+    lo <- quant[1] - offset
+    hi <- quant[2] + offset
+    for (j in 1:nrow(train_data_clean2)) {
+        datum <- train_data_clean2[j, i]
+        is_outlier <- (datum > hi) | (datum < lo)
+        if (is_outlier)
+            train_data_clean2[j, num_cols] <- NA
+    }
+}
+train_data_clean2 <- train_data_clean2 %>%
+    filter(!is.na(classe))
+
+```
+
+Now we can examine correlations among the cleaned-up variables. Plotting shows that there's no clear pattern to work with for reducing the number of measures under consideration for training models.
+
+```{r, echo = FALSE, cache = TRUE, fig.height = 6}
+
+# there's no obvious pattern of strong correlation among measures
+library(reshape2)
+qplot(x=Var1, y=Var2, data=melt(cor(train_measures)), fill=value, geom="tile") +
+ggtitle("Correlations Among Training Variables") +
+    theme(axis.text.x=element_text(angle = 90))
+
+```
+
+### Selecting Models and Parameters (with Cross-validation)
+
+Given data and a feature set, the next task is to evaluate candidate prediction models and their parameters. Eight models were evaluated, spanning a range of approaches. The goals were both pedagogical - exploring numerous algorithms - and predictive - selecting the best-performing model. Models evaluated were the following:
+
+* Trees
+* Linear Discriminant Analysis (LDA)
+* Naive Bayes
+* Mixture Discriminant Analysis (MDA)
+* LogitBoost
+* Support Vector Machine
+* Gradient Boosted Machine
+* Random Forest
+
+Two popular models were rejected as inappropriate to this problems situation: linear models, which are used for regression problems; and generalized linear models, which are used for classifying binary outcomes.
+
+Each of the models listed above was trained with 10-fold cross-validation, repeated 10 times. This approach was to get a sense of the out-of-sample error for each model. Pre-processing for some models included centering and scaling. After training, the optimal parameters for the final models were captured in the calls to the train() function in the caret package. For example, in the random forest final model, 6 was the optimal value for the number of variables to be randomly sampled as candidates at each split. This model contained 500 trees.
+
+Results showed a range of accuracy between approximately 60% and 100%. Four final models had accuracy of approximately 90% or better: LogitBoost, support vector machine, gradient boosted machine, and random forest. The random forest algorithm showed the best accuracy at approximately 99.7%. The model ranking for kappa was similar. This result is not surprising, since anecdotally, random forest models tend to perform well in contexts such as Kaggle competitions.
+
+```{r, echo = TRUE, cache = TRUE, results = "hide"}
+
+my_seed <- 33833
+
+# repeated k-fold cross-validation
+train_ctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 10)
+
+# Tree
+set.seed(my_seed)
+my_grid <- expand.grid(cp = 0.02392052)
+mod_fit_tree <- train(classe ~ ., method = "rpart", data = train_data_clean2,
+                      trControl = train_ctrl, tuneGrid = my_grid)
+
+# LDA
+set.seed(my_seed)
+mod_fit_lda <- train(classe ~ ., method = "lda", data = train_data_clean2,
+                     preProcess = c("center", "scale"), trControl = train_ctrl)
+
+# Naive Bayes
+set.seed(my_seed)
+my_grid <- expand.grid(fL = 0, usekernel = TRUE)
+mod_fit_nb <- train(classe ~ ., method = "nb", data = train_data_clean2,
+                    trControl = train_ctrl, tuneGrid = my_grid)
+
+# Random Forest
+set.seed(my_seed)
+my_grid <- expand.grid(mtry = 6)
+mod_fit_rf <- train(classe ~ ., method = "rf", preProcess = c("center", "scale"),
+                    data = train_data_clean2, trControl = train_ctrl,
+                    tuneGrid = my_grid)
+
+# Gradient Boosted Machine
+set.seed(my_seed)
+my_grid <- expand.grid(n.trees = 150, interaction.depth = 3, shrinkage = 0.1, 
+                       n.minobsinnode = 10)
+mod_fit_gbm <- train(classe ~ ., method = "gbm", data = train_data_clean2,
+                     trControl = train_ctrl, tuneGrid = my_grid)
+
+# MDA
+set.seed(my_seed)
+my_grid <- expand.grid(subclasses = 4)
+mod_fit_mda <- train(classe ~ ., method = "mda", data = train_data_clean2,
+                     trControl = train_ctrl, tuneGrid = my_grid)
+
+# LogitBoost
+set.seed(my_seed)
+my_grid <- expand.grid(nIter = 31)
+mod_fit_lb <- train(classe ~ ., method = "LogitBoost", data = train_data_clean2,
+                     trControl = train_ctrl, tuneGrid = my_grid)
+
+# Support Vector Machine
+set.seed(my_seed)
+my_grid <- expand.grid(sigma = 0.0141181, C = 1)
+mod_fit_svm <- train(classe ~ ., method = "svmRadial", data = train_data_clean2,
+                    trControl = train_ctrl, tuneGrid = my_grid)
+```
+
+```{r, echo = FALSE, cache = TRUE}
+
+# compare models
+cv_values <- resamples(list(CART = mod_fit_tree, LDA = mod_fit_lda,
+                           NB = mod_fit_nb, RF = mod_fit_rf,
+                           GBM = mod_fit_gbm, MDA = mod_fit_mda,
+                           LogitBoost = mod_fit_lb, SVM = mod_fit_svm))
+dotplot(cv_values, metric = "Accuracy", main = "Dot Plot of Final Models")
+
+```
+
+### Best Final Model (with Out-of-sample Error Rate)
+
+In cross-validation, accuracy and kappa measures were both high for the final random forest model, at 99.7% and 99.6% respectively. Standard deviations for accuracy and kappa were 0.1% and 0.2%, respectively, suggesting that the accuracy and kappa measures were reliable. The out-of-sample error rate is estimated at approximately 0.3%.
+
+```{r, echo = FALSE, cache = TRUE}
+
+mod_fit_rf$results
+    
+```
+
+Because dimensionality reduction was not used in pre-processing for training, we can consider the relative importance of original variables in the final model. A plot shows that the roll of the belt was clearly the most important single variable, by approximately 20%. By way of interpretation, the belt captures the most central position of the body and weight mass. Also, a roll to either side seem likely to indicate an unsafe and off-balance posture for weight lifting. Among the most important 5 variables, 3 of them related to belt orientation (roll, pitch, and yaw).
+
+```{r, echo = FALSE, cache = TRUE, fig.height = 6.5}
+
+plot(varImp(mod_fit_rf), main = "Variable Importance in Random Forest Model")
+
+```
+
+Finally a confusion matrix for the final model shows a relative balance among the outcome classes, as expected. Prediction for no one class out- or under-performed relative to other classes.
+
+```{r, echo = FALSE, cache = TRUE}
+
+mod_fit_rf$finalModel$confusion
+
+```
+
+```{r, echo = FALSE, eval = FALSE, cache = TRUE}
+
+# TEST FINAL MODEL ----------------------------
+
+# verify logistics
+train_predict <- predict(mod_fit_rf, train_data)
+postResample(train_predict, train_data$classe)
+confusionMatrix(train_predict, train_data$classe)
+
+# generate test prediction
+test_predict <- predict(mod_fit_rf, test_data)
+
+# helper function to output submission files
+pml_write_files = function(x){
+    n = length(x)
+    for(i in 1:n){
+        filename = paste0("problem_id_",i,".txt")
+        write.table(x[i], file = filename, quote = FALSE, row.names = FALSE, 
+                    col.names = FALSE)
+    }
+}
+
+# output submission files
+answers <- as.character(test_predict)
+if (!file.exists("Answers"))
+    dir.create("Answers")
+old_dir <- getwd()
+setwd("Answers")
+pml_write_files(answers)
+setwd(old_dir)
+
+```
+
